@@ -1,147 +1,124 @@
+import { GoogleGenerativeAI } from "@google/generative-ai";
 import OpenAI from "openai";
 
-// Initialize Groq. 
-// Note: dangerouslyAllowBrowser is required when running API calls directly from the frontend.
+// Initialization with Multi-Tier Resilience
+const genAI = new GoogleGenerativeAI(import.meta.env.VITE_GEMINI_API_KEY || "");
+
 const groq = new OpenAI({
   baseURL: "https://api.groq.com/openai/v1",
-  apiKey: import.meta.env?.VITE_GROQ_API_KEY, 
+  apiKey: import.meta.env.VITE_GROQ_API_KEY || "",
   dangerouslyAllowBrowser: true 
 });
 
 /**
- * Calculates smart matches using Groq (Llama 3) for the Volunteer Hub.
- * Maintains compatibility with existing Dashboard logic.
+ * Shared Helper: Multi-Tier LLM Execution
+ * Tries Gemini (Primary), then Groq (Fallback), then Local (Failsafe)
  */
-export async function calculateSmartMatches(volunteerProfile, openTasks) {
-  if (!openTasks || openTasks.length === 0) return [];
-
+async function runMultiTierAi(systemInstruction, userPrompt, fallbackResult) {
   try {
-    const prompt = `
-      Act as an Emergency Relief Coordinator for an NGO platform called "Lighthouse".
-      Your goal is to match a volunteer to the most suitable emergency tasks.
-
-      VOLUNTEER PROFILE:
-      - Skills: ${volunteerProfile.skills?.join(', ')}
-      - Base Location: ${JSON.stringify(volunteerProfile.baseLocation)}
-      - Max Travel Radius: ${volunteerProfile.maxTravelDistance} miles
-
-      OPEN TASKS:
-      ${openTasks.map(task => `
-        - Task ID: ${task.id}
-        - Name: ${task.taskName}
-        - Required Skills: ${task.requiredSkills?.join(', ')}
-        - Coordinates: ${JSON.stringify(task.coordinates)}
-      `).join('\n')}
-
-      OUTPUT INSTRUCTIONS:
-      Return a strict JSON array of objects. Each object must have:
-      - taskId (string)
-      - matchScore (number 0-100)
-      - reasoning (string, max 15 words)
-
-      DO NOT include markdown. ONLY the JSON array.
-    `;
-
-    const response = await groq.chat.completions.create({
-      model: "llama-3.1-8b-instant",
-      messages: [
-        { role: "system", content: "You are an AI assistant for Lighthouse. You must return only a raw JSON array of match objects." },
-        { role: "user", content: prompt }
-      ],
-      temperature: 0.1,
+    // TIER 1: GEMINI 1.5 FLASH (Primary)
+    console.log("Attempting Gemini API Match...");
+    const model = genAI.getGenerativeModel({ 
+      model: "gemini-2.5-flash",
+      systemInstruction: systemInstruction 
     });
+    const result = await model.generateContent(userPrompt);
+    const text = result.response.text();
+    return parseJsonResponse(text);
 
-    const text = response.choices[0].message.content;
-    const cleanedText = text.replace(/```json|```/g, '').trim();
-    return JSON.parse(cleanedText);
+  } catch (geminiError) {
+    console.warn("⚠️ Gemini API failed. Triggering Fallback 1 (Groq)...", geminiError);
+    
+    try {
+      // TIER 2: GROQ LLAMA 3 (Fallback)
+      const response = await groq.chat.completions.create({
+        model: "llama-3.1-8b-instant",
+        messages: [
+          { role: "system", content: systemInstruction },
+          { role: "user", content: userPrompt }
+        ],
+        temperature: 0.1,
+      });
+      const text = response.choices[0].message.content;
+      return parseJsonResponse(text);
 
-  } catch (error) {
-    console.error("Lighthouse AI Error:", error);
-    return calculateDeterministicFallback(volunteerProfile, openTasks);
+    } catch (groqError) {
+      console.error("🚨 Groq API failed. Triggering Fallback 2 (Local)...", groqError);
+      // TIER 3: LOCAL FALLBACK (Failsafe)
+      return fallbackResult;
+    }
   }
 }
 
 /**
- * Calculates best volunteers for a specific task (NGO Side).
+ * Helper to ensure we always return a valid JSON array
+ */
+function parseJsonResponse(text) {
+  try {
+    const cleanedText = text.replace(/```json|```/g, '').trim();
+    return JSON.parse(cleanedText);
+  } catch (e) {
+    console.error("Failed to parse AI JSON response:", text);
+    throw new Error("Invalid AI Response Format");
+  }
+}
+
+/**
+ * VOLUNTEER SIDE: Match a volunteer to multiple open tasks.
+ */
+export async function calculateSmartMatches(volunteerProfile, openTasks) {
+  if (!openTasks || openTasks.length === 0) return [];
+
+  const systemInstruction = `
+    You are an AI assistant for the 'Lighthouse' NGO platform. 
+    Match a volunteer to a list of tasks.
+    Return a strict JSON array of objects. Each object must have:
+    - taskId (string)
+    - matchScore (number 0-100)
+    - reasoning (string, max 15 words)
+    DO NOT include markdown. ONLY the JSON array.
+  `;
+
+  const userPrompt = `
+    VOLUNTEER: ${JSON.stringify(volunteerProfile)}
+    TASKS: ${JSON.stringify(openTasks)}
+  `;
+
+  const fallback = openTasks.map(task => ({
+    taskId: task.id,
+    matchScore: 50,
+    reasoning: "Fallback System Engaged: Please review volunteer profiles manually."
+  }));
+
+  return await runMultiTierAi(systemInstruction, userPrompt, fallback);
+}
+
+/**
+ * NGO SIDE: Match multiple volunteers to a specific task.
  */
 export async function findBestVolunteersForTask(task, volunteers) {
   if (!volunteers || volunteers.length === 0) return [];
 
-  try {
-    const prompt = `
-      Act as an NGO Dispatcher for "Lighthouse".
-      Your goal is to find the best volunteers for a specific emergency task.
+  const systemInstruction = `
+    You are an AI assistant for the 'Lighthouse' NGO portal. 
+    Match available volunteers to a specific emergency task.
+    Return a strict JSON array of objects. Each object must have:
+    - volunteerId (string)
+    - matchScore (number 0-100)
+    - reasoning (string, max 15 words)
+    DO NOT include markdown. ONLY the JSON array.
+  `;
 
-      TASK DETAILS:
-      - Name: ${task.taskName}
-      - Required Skills: ${task.requiredSkills?.join(', ')}
+  const userPrompt = `
+    TASK: ${JSON.stringify(task)}
+    VOLUNTEERS: ${JSON.stringify(volunteers)}
+  `;
 
-      POTENTIAL VOLUNTEERS:
-      ${volunteers.map(vol => `
-        - Volunteer ID: ${vol.id}
-        - Name: ${vol.name}
-        - Skills: ${vol.skills?.join(', ')}
-        - Availability: ${JSON.stringify(vol.availability || {})}
-      `).join('\n')}
+  const fallback = volunteers.map(vol => ({
+    volunteerId: vol.id,
+    matchScore: 0,
+    reasoning: "Fallback System Engaged: Please review volunteer profiles manually."
+  }));
 
-      OUTPUT INSTRUCTIONS:
-      Return a strict JSON array of objects. Each object must have:
-      - volunteerId (string)
-      - matchScore (number 0-100)
-      - reasoning (string, max 15 words)
-
-      DO NOT include markdown. ONLY the JSON array.
-    `;
-
-    const response = await groq.chat.completions.create({
-      model: "llama-3.1-8b-instant",
-      messages: [
-        { 
-          role: "system", 
-          content: "You are an AI assistant for the 'Lighthouse' NGO portal. Match volunteers to tasks based on skills and time availability. Provide a score. If a volunteer does NOT match the required skills or time, give them a '0% Match' score and explicitly state: 'Alternative Volunteer: Has different skills and availability.' Keep it to 2 sentences max. Format: '[Score]% Match: [Name]. Reason: [Explanation].' You must return only a raw JSON array of match objects." 
-        },
-        { role: "user", content: prompt }
-      ],
-      temperature: 0.1,
-    });
-
-    const text = response.choices[0].message.content;
-    const cleanedText = text.replace(/```json|```/g, '').trim();
-    return JSON.parse(cleanedText);
-
-  } catch (error) {
-    console.error("NGO AI Matching failed:", error);
-    return calculateNgoFallback(task, volunteers);
-  }
-}
-
-function calculateNgoFallback(task, volunteers) {
-  return volunteers.map(vol => {
-    const taskSkills = task.requiredSkills || [];
-    const volSkills = vol.skills || [];
-    const overlap = taskSkills.filter(s => volSkills.includes(s)).length;
-    const skillScore = taskSkills.length > 0 ? (overlap / taskSkills.length) * 100 : 0;
-
-    return {
-      volunteerId: vol.id,
-      matchScore: Math.round(skillScore),
-      reasoning: "Matched based on skill overlap (Fallback)."
-    };
-  });
-}
-
-function calculateDeterministicFallback(volunteerProfile, openTasks) {
-  return openTasks.map(task => {
-    const taskSkills = task.requiredSkills || [];
-    const userSkills = volunteerProfile.skills || [];
-    const overlap = taskSkills.filter(s => userSkills.includes(s)).length;
-    const skillScore = taskSkills.length > 0 ? (overlap / taskSkills.length) * 100 : 0;
-    const distanceScore = 80; 
-
-    return {
-      taskId: task.id,
-      matchScore: Math.round((skillScore * 0.6) + (distanceScore * 0.4)),
-      reasoning: "Matched based on skill overlap (Fallback)."
-    };
-  });
+  return await runMultiTierAi(systemInstruction, userPrompt, fallback);
 }
