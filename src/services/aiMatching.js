@@ -16,7 +16,7 @@ const groq = new OpenAI({
  */
 async function runMultiTierAi(systemInstruction, userPrompt, fallbackResult) {
   try {
-    // TIER 1: GEMINI 1.5 FLASH (Primary)
+    // TIER 1: GEMINI 2.5 FLASH (Primary)
     console.log("Attempting Gemini API Match...");
     const model = genAI.getGenerativeModel({ 
       model: "gemini-2.5-flash",
